@@ -1,6 +1,8 @@
 package pubsub
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"sort"
 	"sync"
@@ -14,6 +16,7 @@ func TestAddTopic(t *testing.T) {
 	assert := assert.New(t)
 
 	q := NewEventBus(time.Duration(time.Hour))
+
 	err := q.AddTopic("kek", make(chan interface{}))
 	if !assert.NoError(err) {
 		return
@@ -42,6 +45,7 @@ func TestSubscribe(t *testing.T) {
 	assert := assert.New(t)
 
 	q := NewEventBus(time.Duration(time.Hour))
+
 	kekSrc := make(chan interface{})
 	q.AddTopic("kek", kekSrc)
 
@@ -101,4 +105,79 @@ func TestSubscribe(t *testing.T) {
 
 	wg.Wait()
 	time.Sleep(time.Second)
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	q := NewEventBus(time.Hour)
+
+	topic := make(chan interface{})
+	err := q.AddTopic("topic", topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// SUBSCRIBERS
+	subNumber := 10
+	// 10 subscribers
+	subscribersMap := make(map[int]<-chan interface{})
+	for i := 0; i < subNumber; i++ {
+		c, id, err := q.Subscribe("topic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		subscribersMap[id] = c
+	}
+
+	cwg := new(sync.WaitGroup)
+	// clients receive messages
+	resultMap := make(map[int]int)
+	m := new(sync.Mutex)
+	for sid, top := range subscribersMap {
+		cwg.Add(1)
+		go func(subId int, topic <-chan interface{}) {
+			for {
+				select {
+				case msg, ok := <-topic:
+					if !ok {
+						fmt.Println("closed:", subId)
+						cwg.Done()
+						return
+					}
+					m.Lock()
+					resultMap[subId] = msg.(int)
+					m.Unlock()
+				}
+			}
+		}(sid, top)
+	}
+
+	// PUBLISHER
+	pctx, _ := context.WithTimeout(context.Background(), time.Millisecond*1000)
+	// publish messages to topic
+	var i = 0
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-pctx.Done():
+				// no more messages
+				// publisher explicitly closes topic
+				close(topic)
+				return
+			default:
+				i++
+				topic <- i
+			}
+		}
+	}()
+	wg.Wait()
+	cwg.Wait()
+	// assert that all subscribers got all messages
+	for _, v := range resultMap {
+		if v != i {
+			t.Fatal("not all subscribers got all messages")
+		}
+	}
 }

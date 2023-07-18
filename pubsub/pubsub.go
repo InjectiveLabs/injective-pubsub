@@ -7,7 +7,6 @@ import (
 	"github.com/InjectiveLabs/metrics"
 	"github.com/avast/retry-go"
 
-	log "github.com/InjectiveLabs/suplog"
 	"github.com/pkg/errors"
 )
 
@@ -45,7 +44,6 @@ func NewEventBus(
 		subscribers:            make(map[string]map[int]chan<- interface{}),
 		subscribersMux:         new(sync.RWMutex),
 		slowSubscriberMaxDelay: slowSubscriberMaxDelay,
-
 		svcTags: metrics.Tags{
 			"svc": "pubsub",
 		},
@@ -65,20 +63,15 @@ func (m *memEventBus) Topics() (topics []string) {
 }
 
 func (m *memEventBus) AddTopic(name string, src <-chan interface{}) error {
-	m.topicsMux.RLock()
+	m.topicsMux.Lock()
 	_, ok := m.topics[name]
-	m.topicsMux.RUnlock()
-
 	if ok {
+		m.topicsMux.Unlock()
 		return errors.New("topic already registered")
 	}
-
-	m.topicsMux.Lock()
 	m.topics[name] = src
 	m.topicsMux.Unlock()
-
-	go m.publishTopic(name, src)
-
+	m.publishTopic(name, src)
 	return nil
 }
 
@@ -146,18 +139,25 @@ func (m *memEventBus) EventSubscribe(topic string) (msgs <-chan interface{}, sub
 }
 
 func (m *memEventBus) publishTopic(topic string, src <-chan interface{}) {
-	for {
-		msg, ok := <-src
-		if !ok {
-			m.closeAllSubscribers(topic)
-			m.topicsMux.Lock()
-			delete(m.topics, topic)
-			m.topicsMux.Unlock()
-
-			return
+	go func() {
+		wg := &sync.WaitGroup{}
+		for {
+			select {
+			case msg, ok := <-src:
+				if !ok {
+					wg.Wait()
+					m.closeAllSubscribers(topic)
+					m.topicsMux.Lock()
+					delete(m.topics, topic)
+					m.topicsMux.Unlock()
+					return
+				}
+				wg.Add(1)
+				// this cant be  parallelized because we need to keep messages ordered
+				m.publishAllSubscribers(topic, msg, wg)
+			}
 		}
-		go m.publishAllSubscribers(topic, msg)
-	}
+	}()
 }
 
 func (m *memEventBus) closeAllSubscribers(topic string) {
@@ -182,7 +182,7 @@ func copyMap(src map[int]chan<- interface{}) map[int]chan<- interface{} {
 	return dst
 }
 
-func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}) {
+func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}, wgc *sync.WaitGroup) {
 	var subscribers map[int]chan<- interface{}
 
 	m.subscribersMux.RLock()
@@ -195,9 +195,8 @@ func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}) {
 	}
 
 	wg := new(sync.WaitGroup)
-	wg.Add(len(subscribers))
-
 	for _, sub := range subscribers {
+		wg.Add(1)
 		go func(subscriber chan<- interface{}) {
 			metrics.ReportClosureFuncCall("subscriber_publish", m.svcTags)
 			doneFn := metrics.ReportClosureFuncTiming("subscriber_publish", m.svcTags)
@@ -205,26 +204,19 @@ func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}) {
 
 			defer wg.Done()
 
-			defer func() {
-				if r := recover(); r != nil {
-					if err, ok := r.(error); ok {
-						log.WithError(err).Warningln("recovered in publishAllSubscribers")
-					} else {
-						log.WithField("error", r).Warningln("recovered in publishAllSubscribers")
-					}
-				}
-			}()
-
 			timeout := time.NewTimer(m.slowSubscriberMaxDelay)
 			defer timeout.Stop()
 
 			select {
 			case subscriber <- msg:
+
 			case <-timeout.C:
 				metrics.SlowSubscriberEventsDropped(1, m.svcTags)
+				close(sub)
 			}
 		}(sub)
 	}
 
 	wg.Wait()
+	wgc.Done()
 }
