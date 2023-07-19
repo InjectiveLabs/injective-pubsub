@@ -97,6 +97,7 @@ func (m *memEventBus) Subscribe(topic string) (<-chan interface{}, int, error) {
 	}
 	m.subscribers[topic][subID] = inCh
 
+	// here we use a double channel to avoid blocking the publisher
 	go func() {
 		metrics.ReportClosureFuncCall("subscriber_publish", m.svcTags)
 		doneFn := metrics.ReportClosureFuncTiming("subscriber_publish", m.svcTags)
@@ -118,6 +119,7 @@ func (m *memEventBus) Subscribe(topic string) (<-chan interface{}, int, error) {
 		}
 		// close the output channel when the input channel is closed
 		close(outCh)
+		return
 	}()
 
 	return outCh, subID, nil

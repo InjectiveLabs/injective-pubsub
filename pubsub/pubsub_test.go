@@ -181,3 +181,43 @@ func TestGracefulShutdown(t *testing.T) {
 		}
 	}
 }
+
+func TestSlowSubscriber(t *testing.T) {
+	q := NewEventBus(time.Second)
+
+	topic := make(chan interface{})
+	err := q.AddTopic("topic", topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subCh, _, err := q.Subscribe("topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cwg := new(sync.WaitGroup)
+	// clients receive messages
+	cwg.Add(1)
+	go func() {
+		for {
+			select {
+			case _, ok := <-subCh:
+				if !ok {
+					cwg.Done()
+					return
+				}
+				// simulate slow subscriber
+				time.Sleep(time.Second * 2)
+			}
+		}
+	}()
+
+	// PUBLISHER
+	// publish messages to topic
+	var i = 0
+	topic <- i
+	i++
+	topic <- i
+	cwg.Wait()
+}
