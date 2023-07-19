@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"fmt"
+	"github.com/stretchr/testify/require"
 	"log"
 	"sort"
 	"sync"
@@ -199,14 +200,16 @@ func TestSlowSubscriber(t *testing.T) {
 	cwg := new(sync.WaitGroup)
 	// clients receive messages
 	cwg.Add(1)
+	var msg interface{}
 	go func() {
 		for {
 			select {
-			case _, ok := <-subCh:
+			case m, ok := <-subCh:
 				if !ok {
 					cwg.Done()
 					return
 				}
+				msg = m
 				// simulate slow subscriber
 				time.Sleep(time.Second * 2)
 			}
@@ -215,9 +218,10 @@ func TestSlowSubscriber(t *testing.T) {
 
 	// PUBLISHER
 	// publish messages to topic
-	var i = 0
+	var i = 1
 	topic <- i
 	i++
 	topic <- i
 	cwg.Wait()
+	require.Equal(t, 1, msg.(int), "subscriber should receive only first message")
 }
