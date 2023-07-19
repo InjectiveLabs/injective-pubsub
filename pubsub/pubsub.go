@@ -5,8 +5,6 @@ import (
 	"time"
 
 	"github.com/InjectiveLabs/metrics"
-	"github.com/avast/retry-go"
-
 	"github.com/pkg/errors"
 )
 
@@ -78,24 +76,13 @@ func (m *memEventBus) AddTopic(name string, src <-chan interface{}) error {
 var errNoTopic = errors.New("topic not found")
 
 func (m *memEventBus) Subscribe(topic string) (<-chan interface{}, int, error) {
-	if err := retry.Do(
-		func() (err error) {
-			m.topicsMux.RLock()
-			_, ok := m.topics[topic]
-			m.topicsMux.RUnlock()
 
-			if !ok {
-				return errNoTopic
-			}
+	m.topicsMux.RLock()
+	_, ok := m.topics[topic]
+	m.topicsMux.RUnlock()
 
-			return nil
-		},
-		retry.Attempts(5),
-		retry.Delay(1*time.Millisecond),
-		retry.MaxDelay(100*time.Millisecond),
-		retry.DelayType(retry.BackOffDelay),
-	); err != nil {
-		return nil, 0, errors.Errorf("topic not found: %s", topic)
+	if !ok {
+		return nil, 0, errNoTopic
 	}
 
 	inCh := make(chan interface{})
