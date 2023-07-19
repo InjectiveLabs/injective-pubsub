@@ -98,7 +98,8 @@ func (m *memEventBus) Subscribe(topic string) (<-chan interface{}, int, error) {
 		return nil, 0, errors.Errorf("topic not found: %s", topic)
 	}
 
-	ch := make(chan interface{})
+	inCh := make(chan interface{})
+	outCh := make(chan interface{})
 	m.subscribersMux.Lock()
 	defer m.subscribersMux.Unlock()
 
@@ -107,9 +108,32 @@ func (m *memEventBus) Subscribe(topic string) (<-chan interface{}, int, error) {
 	if m.subscribers[topic] == nil {
 		m.subscribers[topic] = make(map[int]chan<- interface{})
 	}
-	m.subscribers[topic][subID] = ch
+	m.subscribers[topic][subID] = inCh
 
-	return ch, subID, nil
+	go func() {
+		metrics.ReportClosureFuncCall("subscriber_publish", m.svcTags)
+		doneFn := metrics.ReportClosureFuncTiming("subscriber_publish", m.svcTags)
+		defer doneFn()
+
+		for msg := range inCh {
+			timeout := time.NewTimer(m.slowSubscriberMaxDelay)
+			defer timeout.Stop()
+
+			select {
+			case outCh <- msg:
+
+			case <-timeout.C:
+				metrics.SlowSubscriberEventsDropped(1, m.svcTags)
+				close(outCh)
+				close(inCh)
+				return
+			}
+		}
+		// close the output channel when the input channel is closed
+		close(outCh)
+	}()
+
+	return outCh, subID, nil
 }
 
 func (m *memEventBus) Unsubscribe(topic string, subID int) error {
@@ -140,21 +164,18 @@ func (m *memEventBus) EventSubscribe(topic string) (msgs <-chan interface{}, sub
 
 func (m *memEventBus) publishTopic(topic string, src <-chan interface{}) {
 	go func() {
-		wg := &sync.WaitGroup{}
 		for {
 			select {
 			case msg, ok := <-src:
 				if !ok {
-					wg.Wait()
 					m.closeAllSubscribers(topic)
 					m.topicsMux.Lock()
 					delete(m.topics, topic)
 					m.topicsMux.Unlock()
 					return
 				}
-				wg.Add(1)
 				// this cant be  parallelized because we need to keep messages ordered
-				m.publishAllSubscribers(topic, msg, wg)
+				m.publishAllSubscribers(topic, msg)
 			}
 		}
 	}()
@@ -182,7 +203,7 @@ func copyMap(src map[int]chan<- interface{}) map[int]chan<- interface{} {
 	return dst
 }
 
-func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}, wgc *sync.WaitGroup) {
+func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}) {
 	var subscribers map[int]chan<- interface{}
 
 	m.subscribersMux.RLock()
@@ -194,29 +215,7 @@ func (m *memEventBus) publishAllSubscribers(topic string, msg interface{}, wgc *
 		return
 	}
 
-	wg := new(sync.WaitGroup)
 	for _, sub := range subscribers {
-		wg.Add(1)
-		go func(subscriber chan<- interface{}) {
-			metrics.ReportClosureFuncCall("subscriber_publish", m.svcTags)
-			doneFn := metrics.ReportClosureFuncTiming("subscriber_publish", m.svcTags)
-			defer doneFn()
-
-			defer wg.Done()
-
-			timeout := time.NewTimer(m.slowSubscriberMaxDelay)
-			defer timeout.Stop()
-
-			select {
-			case subscriber <- msg:
-
-			case <-timeout.C:
-				metrics.SlowSubscriberEventsDropped(1, m.svcTags)
-				close(sub)
-			}
-		}(sub)
+		sub <- msg
 	}
-
-	wg.Wait()
-	wgc.Done()
 }
