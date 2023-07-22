@@ -1,219 +1,327 @@
 package pubsub
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
+)
 
-	"github.com/InjectiveLabs/metrics"
+const (
+	DefaultPublisherBuffer = 100
+	DefaultCloseTimeout    = 5 * time.Second
 )
 
 var (
+	ErrBusClosed          = errors.New("bus closed")
 	ErrTopicNotFound      = errors.New("topic not found")
-	ErrSubscriberNotFound = errors.New("subscriber not found")
+	ErrPublisherClosed    = errors.New("publisher closed")
+	ErrSubscriberDropped  = errors.New("subscriber dropped")
+	ErrSubscriberClosed   = errors.New("subscriber closed")
+	ErrTopicAlreadyExists = errors.New("topic already exists")
 )
 
-type EventBus interface {
-	EventSubscriber
-
-	AddTopic(name string, src <-chan interface{}) error
-	Subscribe(name string) (<-chan interface{}, int, error)
-	Unsubscribe(name string, subID int) error
-	Topics() []string
+type Message struct {
+	ID      []byte
+	Payload interface{}
 }
 
-type EventSubscriber interface {
-	EventSubscribe(topic string) (msgs <-chan interface{}, subID int, err error)
-	EventUnsubscribe(topic string, subID int) error
+type Subscriber interface {
+	// Next blocks until a message is received or:
+	//	- the context is canceled, returning the context error
+	//	- the subscriber is closed, returning ErrSubscriberClosed
+	//	- the publisher closes and the bus configuration doesn't wait on subscribers
+	Next(ctx context.Context) (*Message, error)
+
+	// Close closes the subscriber and releases any resources held.
+	//
+	// If close is while Next is waiting on a message, Next will
+	// return with ErrSubscriberClosed.
+	Close()
 }
 
-type subscriber struct {
-	ch     chan<- interface{}
-	closed uint32
+type Bus interface {
+	Publish(ctx context.Context, topic string, msg *Message) error
+	Subscribe(ctx context.Context, topic string) (Subscriber, error)
+	AddTopic(ctx context.Context, topic string) error
 }
 
-func (s *subscriber) close() {
-	if atomic.SwapUint32(&s.closed, 1) == 1 {
-		return
-	}
-	close(s.ch)
-	s.ch = nil
+type MemBusConfig struct {
+	// PublisherBuffer is the buffer size for each topic publisher.
+	PublisherBuffer int
+
+	// SubscriberBuffer is the buffer size for each subscriber.
+	SubscriberBuffer int
+
+	// DropSlowSubscribers will close and drop a subscriber if their buffer is full.
+	DropSlowSubscribers bool
+
+	// CloseTimeout sets the timeout for waiting on subscribers to receive all buffered messages
+	//  when closing the bus.
+	CloseTimeout time.Duration
 }
 
-func (s *subscriber) send(msg interface{}) {
-	if atomic.LoadUint32(&s.closed) == 1 {
-		return
-	}
-
-	s.ch <- msg
+type MemBus struct {
+	cfg    *MemBusConfig
+	topics map[string]*memPublisher
+	closed bool
+	mx     sync.RWMutex
 }
 
-type MemEventBus struct {
-	topics                 map[string]<-chan interface{}
-	topicsMux              *sync.RWMutex
-	subscribers            map[string]map[int]*subscriber
-	subscribersMux         *sync.RWMutex
-	ids                    int
-	slowSubscriberMaxDelay time.Duration
-
-	svcTags metrics.Tags
-}
-
-func NewEventBus(
-	slowSubscriberMaxDelay time.Duration,
-) *MemEventBus {
-	return &MemEventBus{
-		topics:                 make(map[string]<-chan interface{}),
-		topicsMux:              new(sync.RWMutex),
-		subscribers:            make(map[string]map[int]*subscriber),
-		subscribersMux:         new(sync.RWMutex),
-		slowSubscriberMaxDelay: slowSubscriberMaxDelay,
-		svcTags: metrics.Tags{
-			"svc": "pubsub",
-		},
+func NewMemBus(cfg MemBusConfig) *MemBus {
+	return &MemBus{
+		cfg:    &cfg,
+		topics: make(map[string]*memPublisher),
 	}
 }
 
-func (m *MemEventBus) Topics() (topics []string) {
-	m.topicsMux.RLock()
-	defer m.topicsMux.RUnlock()
+func (m *MemBus) AddTopic(_ context.Context, topic string) error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
 
-	topics = make([]string, 0, len(m.topics))
-	for topicName := range m.topics {
-		topics = append(topics, topicName)
+	if m.closed {
+		return ErrBusClosed
+	}
+	if m.topics[topic] != nil {
+		return ErrTopicAlreadyExists
 	}
 
-	return topics
-}
+	p := newMemPublisher(m.cfg)
+	p.run()
 
-func (m *MemEventBus) AddTopic(name string, src <-chan interface{}) error {
-	m.topicsMux.Lock()
-	_, ok := m.topics[name]
-	if ok {
-		m.topicsMux.Unlock()
-		return errors.New("topic already registered")
-	}
-	m.topics[name] = src
-	m.topicsMux.Unlock()
-	m.publishTopic(name, src)
+	m.topics[topic] = p
 	return nil
 }
 
-func (m *MemEventBus) Subscribe(topic string) (<-chan interface{}, int, error) {
+func (m *MemBus) Subscribe(_ context.Context, topic string) (Subscriber, error) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
 
-	m.topicsMux.RLock()
-	_, ok := m.topics[topic]
-	m.topicsMux.RUnlock()
+	if m.closed {
+		return nil, ErrBusClosed
+	}
+	p, ok := m.topics[topic]
+	if !ok {
+		return nil, ErrTopicNotFound
+	}
+
+	s := newMemSubscriber(m.cfg.SubscriberBuffer)
+
+	if err := p.addSubscriber(s); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+func (m *MemBus) Publish(ctx context.Context, topic string, msg *Message) error {
+	m.mx.RLock()
+	if m.closed {
+		m.mx.RUnlock()
+		return ErrBusClosed
+	}
+	p, ok := m.topics[topic]
+	m.mx.RUnlock()
 
 	if !ok {
-		return nil, 0, ErrTopicNotFound
+		return ErrTopicNotFound
 	}
 
-	inCh := make(chan interface{})
-	outCh := make(chan interface{})
-	m.subscribersMux.Lock()
-	defer m.subscribersMux.Unlock()
+	return p.publish(ctx, msg)
+}
 
-	m.ids++
-	if m.ids <= 0 {
-		m.ids = 1
-	}
-	subID := m.ids
-	if m.subscribers[topic] == nil {
-		m.subscribers[topic] = make(map[int]*subscriber)
-	}
-	s := &subscriber{ch: inCh}
-	m.subscribers[topic][subID] = s
+func (m *MemBus) Close() {
+	m.mx.Lock()
+	defer m.mx.Unlock()
 
-	// here we use a double channel to avoid blocking the publisher
+	if m.closed {
+		return
+	}
+	m.closed = true
+
+	t := m.cfg.CloseTimeout
+	if t == 0 {
+		t = DefaultCloseTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), t)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, p := range m.topics {
+		wg.Add(1)
+		go func(p *memPublisher) {
+			defer wg.Done()
+			p.close(ctx)
+		}(p)
+	}
+	wg.Wait()
+	m.topics = nil
+}
+
+type memPublisher struct {
+	cfg        *MemBusConfig
+	subscriber []*memSubscriber
+	messages   chan *Message
+	mx         sync.RWMutex
+	wg         sync.WaitGroup
+	closed     bool
+	done       chan struct{}
+	stop       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func newMemPublisher(cfg *MemBusConfig) *memPublisher {
+	return &memPublisher{
+		cfg:      cfg,
+		messages: make(chan *Message),
+	}
+}
+
+func (p *memPublisher) publish(ctx context.Context, msg *Message) error {
+	p.mx.Lock()
+	if p.closed {
+		p.mx.Unlock()
+		return ErrPublisherClosed
+	}
+	// we need to add the wait group before unlocking or calling
+	// close may panic on thw workgroup wait
+	p.wg.Add(1)
+	p.mx.Unlock()
+	defer p.wg.Done()
+
+	select {
+	case <-p.stop:
+		// wrong usage, bus closed while publishing
+		return ErrBusClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case p.messages <- msg:
+		return nil
+	}
+}
+
+func (p *memPublisher) run() {
+	// fanout is called before the publisher is available, no need to lock
+	p.wg.Add(1)
 	go func() {
-		defer close(outCh)
-		metrics.ReportClosureFuncCall("subscriber_publish", m.svcTags)
-		doneFn := metrics.ReportClosureFuncTiming("subscriber_publish", m.svcTags)
-		defer doneFn()
-
-		for msg := range inCh {
-			timeout := time.NewTimer(m.slowSubscriberMaxDelay)
-
+		defer p.wg.Done()
+		for {
 			select {
-			case outCh <- msg:
-				timeout.Stop()
+			case <-p.stop:
+				return
+			case msg := <-p.messages:
+				p.fanoutToSubscribers(msg)
+			}
+		}
+	}()
+}
 
-			case <-timeout.C:
-				timeout.Stop()
+func (p *memPublisher) fanoutToSubscribers(msg *Message) {
+	p.mx.Lock()
+	defer p.mx.Unlock()
 
-				metrics.SlowSubscriberEventsDropped(1, m.svcTags)
-				s.close()
+	var wg sync.WaitGroup
+	for i, s := range p.subscriber {
+		wg.Add(1)
+		go func(i int, s *memSubscriber) {
+			defer wg.Done()
+			select {
+			case s.buffer <- msg:
+				return
+			case <-p.stop:
+			case <-s.stop:
+			default:
+				s.stopWithErr(ErrSubscriberDropped)
+			}
+			p.subscriber[i] = p.subscriber[len(p.subscriber)-1]
+			p.subscriber = p.subscriber[:len(p.subscriber)-1]
+		}(i, s)
+	}
+	wg.Wait()
+}
+
+func (p *memPublisher) close(ctx context.Context) {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if p.closed {
+		return
+	}
+	p.closed = true
+	close(p.stop)
+
+	p.wg.Wait()
+}
+
+func (p *memPublisher) addSubscriber(subscriber *memSubscriber) error {
+	p.mx.Lock()
+	defer p.mx.Unlock()
+
+	if p.closed {
+		// wrong usage, publisher closed while subscribing
+		return ErrPublisherClosed
+	}
+
+	p.subscriber = append(p.subscriber, subscriber)
+
+	p.wg.Add(1)
+	go func() {
+		for {
+			select {
+			case <-p.stop:
 				return
 			}
 		}
 	}()
 
-	return outCh, subID, nil
-}
-
-func (m *MemEventBus) Unsubscribe(topic string, subID int) error {
-	m.subscribersMux.Lock()
-	defer m.subscribersMux.Unlock()
-
-	topicSubscribers := m.subscribers[topic]
-	s, ok := topicSubscribers[subID]
-	if !ok {
-		return fmt.Errorf("%w: to %s with ID %d", ErrSubscriberNotFound, topic, subID)
-	}
-
-	delete(topicSubscribers, subID)
-	s.close()
-
 	return nil
 }
 
-func (m *MemEventBus) EventUnsubscribe(topic string, subID int) error {
-	return m.Unsubscribe(topic, subID)
+type memSubscriber struct {
+	buffer chan *Message
+	mx     sync.RWMutex
+	stop   chan struct{}
+	done   chan struct{}
+	err    error
+	closed bool
 }
 
-// EventSubscribe implements EventSubscriber
-func (m *MemEventBus) EventSubscribe(topic string) (msgs <-chan interface{}, subID int, err error) {
-	return m.Subscribe(topic)
+func newMemSubscriber(maxBuffer int) *memSubscriber {
+	return &memSubscriber{
+		buffer: make(chan *Message, maxBuffer),
+		stop:   make(chan struct{}),
+	}
 }
 
-func (m *MemEventBus) publishTopic(topic string, src <-chan interface{}) {
-	go func() {
-		for {
-			select {
-			case msg, ok := <-src:
-				if !ok {
-					m.topicsMux.Lock()
-					delete(m.topics, topic)
-					m.closeAllSubscribers(topic)
-					m.topicsMux.Unlock()
-					return
-				}
-				// this cant be  parallelized because we need to keep messages ordered
-				m.publishAllSubscribers(topic, msg)
-			}
+func (s *memSubscriber) Next(ctx context.Context) (*Message, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.stop:
+		return nil, s.err
+	case msg, ok := <-s.buffer:
+		if !ok {
+			return nil, ErrPublisherClosed
 		}
-	}()
-}
-
-func (m *MemEventBus) closeAllSubscribers(topic string) {
-	m.subscribersMux.Lock()
-	subscribers := m.subscribers[topic]
-	delete(m.subscribers, topic)
-	m.subscribersMux.Unlock()
-
-	for _, sub := range subscribers {
-		sub.close()
+		return msg, nil
 	}
 }
 
-func (m *MemEventBus) publishAllSubscribers(topic string, msg interface{}) {
-	m.subscribersMux.RLock()
-	defer m.subscribersMux.RUnlock()
+func (s *memSubscriber) close() {
+	s.stopWithErr(ErrSubscriberClosed)
+}
 
-	for _, sub := range m.subscribers[topic] {
-		sub.send(msg)
+func (s *memSubscriber) stopWithErr(err error) {
+	s.mx.Lock()
+	if s.closed {
+		s.mx.Unlock()
+		return
 	}
+	s.closed = true
+	s.mx.Unlock()
+
+	s.err = err
+	close(s.stop)
 }
